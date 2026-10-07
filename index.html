@@ -94,7 +94,7 @@
 </style>
 </head>
 <body>
-<header>PLA 時空の歪み監視</header>
+<header>PLA 時空の歪み監視 v2</header>
 <div class="wrap">
 
   <video id="video" playsinline muted></video>
@@ -121,14 +121,14 @@
   </div>
 
   <div class="slider">
-    <div>検知しきい値: <strong id="thresholdText">0.70</strong></div>
-    <input id="threshold" type="range" min="0.40" max="0.95" step="0.01" value="0.70">
+    <div>検知しきい値: <strong id="thresholdText">0.80</strong></div>
+    <input id="threshold" type="range" min="0.50" max="0.99" step="0.01" value="0.80">
   </div>
 
   <div class="help">
     <strong>登録方法</strong><br>
     「時空の歪みが発生しそうだ」がSwitch画面に出ている状態で
-    「テンプレート登録」を押し、文字の周囲を指でドラッグして囲んでください。<br><br>
+    「テンプレート登録」を押し、映像を静止させてから文字の周囲を指でドラッグして囲んでください。登録後は枠が消えます。<br>一致率は文字の輪郭の類似度です（確率ではありません）。まず0.80で試し、誤検知があれば上げてください。<br><br>
     監視中はiPhoneを固定し、画面を消さないでください。
   </div>
 </div>
@@ -292,16 +292,10 @@ async function startCamera() {
 function drawLoop(ts) {
   if (!stream) return;
 
-  procCtx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
+  if (!selecting) procCtx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
 
   ctx.clearRect(0, 0, view.width, view.height);
   ctx.drawImage(procCanvas, 0, 0);
-
-  if (roi) {
-    ctx.strokeStyle = monitoring ? "#00ff73" : "#ffd54a";
-    ctx.lineWidth = 2;
-    ctx.strokeRect(roi.x, roi.y, roi.w, roi.h);
-  }
 
   if (selecting && drawing && startPt && currentPt) {
     const r = rectFromPoints(startPt, currentPt);
@@ -369,33 +363,59 @@ view.addEventListener("pointerup", e => {
     h: Math.round(r.h)
   };
 
-  createTemplateFromCurrentFrame();
+  if (!createTemplateFromCurrentFrame()) return;
   selecting = false;
+  startPt = currentPt = null;
   setState("テンプレート登録完了", "ok");
 });
 
 function startTemplateSelection() {
   monitoring = false;
+  stopAlarm();
+  hits = misses = 0;
+  armed = true;
+  drawing = false;
+  startPt = currentPt = null;
   monitorBtn.textContent = "③ 監視開始";
   selecting = true;
   setState("文字を指で囲んでください", "warn");
 }
 
+// Extract locally bright strokes; absolute brightness alone also matches sky.
 function toBinary(imageData) {
-  const src = imageData.data;
-  const out = new Uint8Array(imageData.width * imageData.height);
-
-  for (let i = 0, p = 0; i < src.length; i += 4, p++) {
-    const y = 0.299 * src[i] + 0.587 * src[i+1] + 0.114 * src[i+2];
-    out[p] = y >= WHITE_THRESHOLD ? 1 : 0;
+  const {width:w, height:h, data:src} = imageData;
+  const gray = new Float32Array(w*h);
+  const integral = new Float64Array((w+1)*(h+1));
+  for (let y=0; y<h; y++) {
+    let row=0;
+    for (let x=0; x<w; x++) {
+      const p=y*w+x, i=p*4;
+      gray[p]=0.299*src[i]+0.587*src[i+1]+0.114*src[i+2];
+      row+=gray[p];
+      integral[(y+1)*(w+1)+x+1]=integral[y*(w+1)+x+1]+row;
+    }
   }
-
+  const out=new Uint8Array(w*h), radius=4;
+  for (let y=0; y<h; y++) for (let x=0; x<w; x++) {
+    const x1=Math.max(0,x-radius), x2=Math.min(w,x+radius+1);
+    const y1=Math.max(0,y-radius), y2=Math.min(h,y+radius+1);
+    const sum=integral[y2*(w+1)+x2]-integral[y1*(w+1)+x2]
+      -integral[y2*(w+1)+x1]+integral[y1*(w+1)+x1];
+    const mean=sum/((x2-x1)*(y2-y1));
+    out[y*w+x]=(gray[y*w+x]>=150 && gray[y*w+x]-mean>=12)?1:0;
+  }
   return out;
 }
 
 function createTemplateFromCurrentFrame() {
   const img = procCtx.getImageData(roi.x, roi.y, roi.w, roi.h);
-  templateBinary = toBinary(img);
+  const candidate = toBinary(img);
+  const density = candidate.reduce((a,b)=>a+b,0)/candidate.length;
+  if (density < 0.015 || density > 0.45) {
+    alert("文字の輪郭が不足しています。文字が表示されているときに、文字の周囲を狭めに囲んでください。");
+    return false;
+  }
+  templateBinary = candidate;
   templateW = roi.w;
   templateH = roi.h;
 
@@ -407,18 +427,20 @@ function createTemplateFromCurrentFrame() {
   const dataUrl = tempCanvas.toDataURL("image/png");
 
   const data = {
+    version: 2,
     roi,
     dataUrl,
     canvasW: procCanvas.width,
     canvasH: procCanvas.height
   };
 
-  localStorage.setItem("plaTemplate", JSON.stringify(data));
+  try { localStorage.setItem("plaTemplate", JSON.stringify(data)); } catch(e) {}
 
   templatePreview.src = dataUrl;
   templatePreview.style.display = "block";
   templateStateEl.textContent = "登録済み";
   monitorBtn.disabled = false;
+  return true;
 }
 
 function restoreTemplate() {
@@ -427,6 +449,10 @@ function restoreTemplate() {
 
   try {
     const saved = JSON.parse(raw);
+    if (saved.version !== 2) {
+      templateStateEl.textContent = "再登録してください（判定方式を更新）";
+      return;
+    }
     const sx = procCanvas.width / saved.canvasW;
     const sy = procCanvas.height / saved.canvasH;
 
@@ -462,6 +488,7 @@ function restoreTemplate() {
 }
 
 function diceScoreAt(searchBin, searchW, searchH, tx, ty) {
+  if (tx < 0 || ty < 0 || tx + templateW > searchW || ty + templateH > searchH) return 0;
   let inter = 0;
   let a = 0;
   let b = 0;
@@ -526,7 +553,7 @@ function processFrame() {
   const threshold = Number(thresholdInput.value);
 
   if (score >= threshold) {
-    hits++;
+    hits = Math.min(hits + 1, CONSECUTIVE_HITS);
     misses = 0;
   } else {
     hits = 0;
@@ -552,7 +579,9 @@ function toggleMonitoring() {
     return;
   }
 
+  if (selecting) return;
   monitoring = !monitoring;
+  if (!monitoring) stopAlarm();
   hits = 0;
   misses = 0;
   armed = true;
