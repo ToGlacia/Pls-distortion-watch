@@ -94,7 +94,7 @@
 </style>
 </head>
 <body>
-<header>PLA 時空の歪み監視 v2</header>
+<header>PLA 時空の歪み監視 v3</header>
 <div class="wrap">
 
   <video id="video" playsinline muted></video>
@@ -121,14 +121,14 @@
   </div>
 
   <div class="slider">
-    <div>検知しきい値: <strong id="thresholdText">0.80</strong></div>
-    <input id="threshold" type="range" min="0.50" max="0.99" step="0.01" value="0.80">
+    <div>検知しきい値: <strong id="thresholdText">0.65</strong></div>
+    <input id="threshold" type="range" min="0.50" max="0.99" step="0.01" value="0.65">
   </div>
 
   <div class="help">
     <strong>登録方法</strong><br>
     「時空の歪みが発生しそうだ」がSwitch画面に出ている状態で
-    「テンプレート登録」を押し、映像を静止させてから文字の周囲を指でドラッグして囲んでください。登録後は枠が消えます。<br>一致率は文字の輪郭の類似度です（確率ではありません）。まず0.80で試し、誤検知があれば上げてください。<br><br>
+    「テンプレート登録」を押し、映像を静止させてから文字の周囲を指でドラッグして囲んでください。登録後は枠が消えます。<br>一致率は文字の輪郭の類似度です（確率ではありません）。まず0.65で試し、誤検知があれば上げてください。<br><br>
     監視中はiPhoneを固定し、画面を消さないでください。
   </div>
 </div>
@@ -487,34 +487,30 @@ function restoreTemplate() {
   }
 }
 
-function diceScoreAt(searchBin, searchW, searchH, tx, ty) {
-  if (tx < 0 || ty < 0 || tx + templateW > searchW || ty + templateH > searchH) return 0;
-  let inter = 0;
-  let a = 0;
-  let b = 0;
-
-  for (let y = 0; y < templateH; y++) {
-    const sy = ty + y;
-    if (sy < 0 || sy >= searchH) continue;
-
-    const tRow = y * templateW;
-    const sRow = sy * searchW;
-
-    for (let x = 0; x < templateW; x++) {
-      const sx = tx + x;
-      if (sx < 0 || sx >= searchW) continue;
-
-      const tv = templateBinary[tRow + x];
-      const sv = searchBin[sRow + sx];
-
-      a += tv;
-      b += sv;
-      if (tv && sv) inter++;
+// Symmetric stroke matching with one-pixel tolerance; extra background
+// strokes reduce precision instead of increasing the score.
+function dilateMask(mask, w, h) {
+  const out = new Uint8Array(mask.length);
+  for (let y=0;y<h;y++) for(let x=0;x<w;x++) {
+    if (!mask[y*w+x]) continue;
+    for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++) {
+      const xx=x+dx, yy=y+dy;
+      if(xx>=0 && yy>=0 && xx<w && yy<h) out[yy*w+xx]=1;
     }
   }
-
-  if (a + b === 0) return 0;
-  return (2 * inter) / (a + b);
+  return out;
+}
+function diceScoreAt(searchBin, searchW, searchH, tx, ty, searchWide, templateWide) {
+  if(tx<0 || ty<0 || tx+templateW>searchW || ty+templateH>searchH) return 0;
+  let a=0,b=0,matchedA=0,matchedB=0;
+  for(let y=0;y<templateH;y++) for(let x=0;x<templateW;x++) {
+    const t=y*templateW+x, q=(ty+y)*searchW+tx+x;
+    if(templateBinary[t]) {a++; matchedA+=searchWide[q];}
+    if(searchBin[q]) {b++; matchedB+=templateWide[t];}
+  }
+  if(!a || !b) return 0;
+  const recall=matchedA/a, precision=matchedB/b;
+  return recall+precision ? 2*recall*precision/(recall+precision) : 0;
 }
 
 function processFrame() {
@@ -531,7 +527,9 @@ function processFrame() {
   const imageData = procCtx.getImageData(x1, y1, sw, sh);
   const searchBin = toBinary(imageData);
 
-  let best = 0;
+  const searchWide = dilateMask(searchBin, sw, sh);
+  const templateWide = dilateMask(templateBinary, templateW, templateH);
+  let best = 0, bestX = 0, bestY = 0;
 
   const baseX = roi.x - x1;
   const baseY = roi.y - y1;
@@ -541,12 +539,19 @@ function processFrame() {
       const s = diceScoreAt(
         searchBin, sw, sh,
         baseX + dx,
-        baseY + dy
+        baseY + dy, searchWide, templateWide
       );
-      if (s > best) best = s;
+      if (s > best) { best = s; bestX = dx; bestY = dy; }
     }
   }
 
+  // Refine the coarse search so thin text is not missed between grid points.
+  const refineX=bestX, refineY=bestY;
+  for(let dy=Math.max(-SEARCH_MARGIN,refineY-2);dy<=Math.min(SEARCH_MARGIN,refineY+2);dy++) {
+    for(let dx=Math.max(-SEARCH_MARGIN,refineX-2);dx<=Math.min(SEARCH_MARGIN,refineX+2);dx++) {
+      best=Math.max(best,diceScoreAt(searchBin,sw,sh,baseX+dx,baseY+dy,searchWide,templateWide));
+    }
+  }
   score = best;
   scoreEl.textContent = score.toFixed(3);
 
