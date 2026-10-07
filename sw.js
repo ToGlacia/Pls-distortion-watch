@@ -1,4 +1,4 @@
-const CACHE = "pla-watch-v3";
+const CACHE = "pla-watch-v4";
 
 self.addEventListener("install", event => {
   self.skipWaiting();

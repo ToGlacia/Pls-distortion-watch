@@ -33,8 +33,11 @@
   }
   #view {
     display: block;
-    width: 100%;
+    width: auto;
     height: auto;
+    max-width: 100%;
+    max-height: 150px;
+    margin: 0 auto;
     background: #111;
   }
   .status {
@@ -94,7 +97,7 @@
 </style>
 </head>
 <body>
-<header>PLA 時空の歪み監視 v3</header>
+<header>PLA 時空の歪み監視 v4</header>
 <div class="wrap">
 
   <video id="video" playsinline muted></video>
@@ -114,6 +117,7 @@
   <div class="controls">
     <button id="cameraBtn" class="primary">① カメラ開始</button>
     <button id="templateBtn" disabled>② テンプレート登録</button>
+    <button id="regionBtn" disabled>文字を探す範囲を設定</button>
     <button id="monitorBtn" disabled>③ 監視開始</button>
     <button id="notifyBtn">通知を許可</button>
     <button id="testBtn">テスト警報</button>
@@ -126,10 +130,13 @@
   </div>
 
   <div class="help">
-    <strong>登録方法</strong><br>
-    「時空の歪みが発生しそうだ」がSwitch画面に出ている状態で
-    「テンプレート登録」を押し、映像を静止させてから文字の周囲を指でドラッグして囲んでください。登録後は枠が消えます。<br>一致率は文字の輪郭の類似度です（確率ではありません）。まず0.65で試し、誤検知があれば上げてください。<br><br>
-    監視中はiPhoneを固定し、画面を消さないでください。
+    <strong>設定手順</strong><br>
+    ① 小さなカメラ表示にSwitch画面全体が収まる位置で固定してください。<br>
+    ② 文字が出ているときに「テンプレート登録」を押し、文字だけを囲んでください。<br>
+    ③ 「文字を探す範囲を設定」を押し、文字が出る辺りを少し広めに囲んでください。指定範囲の中だけで探します。<br>
+    ④ 監視開始。登録・範囲設定後の枠は消えます。<br><br>
+    しきい値はまず0.65。範囲設定はカメラ起動・テンプレート登録後に行ってください。
+    カメラ位置や距離を変えたら再登録してください。監視中は画面を消さないでください。
   </div>
 </div>
 
@@ -141,6 +148,7 @@ const view = document.getElementById("view");
 const ctx = view.getContext("2d", { willReadFrequently: true });
 
 const cameraBtn = document.getElementById("cameraBtn");
+const regionBtn = document.getElementById("regionBtn");
 const templateBtn = document.getElementById("templateBtn");
 const monitorBtn = document.getElementById("monitorBtn");
 const notifyBtn = document.getElementById("notifyBtn");
@@ -161,6 +169,8 @@ const procCtx = procCanvas.getContext("2d", { willReadFrequently: true });
 let stream = null;
 let monitoring = false;
 let selecting = false;
+let selectionMode = "template";
+let searchRegion = null;
 let drawing = false;
 let startPt = null;
 let currentPt = null;
@@ -325,7 +335,7 @@ function pointerToCanvas(e) {
   const rect = view.getBoundingClientRect();
   const x = (e.clientX - rect.left) * view.width / rect.width;
   const y = (e.clientY - rect.top) * view.height / rect.height;
-  return {x, y};
+  return {x: Math.max(0, Math.min(view.width, x)), y: Math.max(0, Math.min(view.height, y))};
 }
 
 view.addEventListener("pointerdown", e => {
@@ -356,6 +366,18 @@ view.addEventListener("pointerup", e => {
     return;
   }
 
+  if (selectionMode === "region") {
+    const candidate = { x: Math.floor(r.x), y: Math.floor(r.y), w: Math.floor(r.w), h: Math.floor(r.h) };
+    if (candidate.w < templateW || candidate.h < templateH) {
+      alert("登録した文字画像が入るように、少し広く囲んでください。");
+      return;
+    }
+    searchRegion = candidate;
+    selecting = false;
+    startPt = currentPt = null;
+    setState("検索範囲を設定しました", "ok");
+    return;
+  }
   roi = {
     x: Math.round(r.x),
     y: Math.round(r.y),
@@ -377,6 +399,7 @@ function startTemplateSelection() {
   drawing = false;
   startPt = currentPt = null;
   monitorBtn.textContent = "③ 監視開始";
+  selectionMode = "template";
   selecting = true;
   setState("文字を指で囲んでください", "warn");
 }
@@ -416,6 +439,7 @@ function createTemplateFromCurrentFrame() {
     return false;
   }
   templateBinary = candidate;
+  searchRegion = null;
   templateW = roi.w;
   templateH = roi.h;
 
@@ -440,6 +464,7 @@ function createTemplateFromCurrentFrame() {
   templatePreview.style.display = "block";
   templateStateEl.textContent = "登録済み";
   monitorBtn.disabled = false;
+  regionBtn.disabled = false;
   return true;
 }
 
@@ -480,6 +505,7 @@ function restoreTemplate() {
       templatePreview.style.display = "block";
       templateStateEl.textContent = "登録済み";
       monitorBtn.disabled = false;
+  regionBtn.disabled = false;
     };
     img.src = saved.dataUrl;
   } catch(e) {
@@ -516,10 +542,11 @@ function diceScoreAt(searchBin, searchW, searchH, tx, ty, searchWide, templateWi
 function processFrame() {
   if (!roi || !templateBinary) return;
 
-  const x1 = Math.max(0, roi.x - SEARCH_MARGIN);
-  const y1 = Math.max(0, roi.y - SEARCH_MARGIN);
-  const x2 = Math.min(procCanvas.width, roi.x + roi.w + SEARCH_MARGIN);
-  const y2 = Math.min(procCanvas.height, roi.y + roi.h + SEARCH_MARGIN);
+  const region = searchRegion || {x:roi.x-SEARCH_MARGIN, y:roi.y-SEARCH_MARGIN, w:roi.w+SEARCH_MARGIN*2, h:roi.h+SEARCH_MARGIN*2};
+  const x1 = Math.max(0, region.x);
+  const y1 = Math.max(0, region.y);
+  const x2 = Math.min(procCanvas.width, region.x + region.w);
+  const y2 = Math.min(procCanvas.height, region.y + region.h);
 
   const sw = x2 - x1;
   const sh = y2 - y1;
@@ -531,25 +558,17 @@ function processFrame() {
   const templateWide = dilateMask(templateBinary, templateW, templateH);
   let best = 0, bestX = 0, bestY = 0;
 
-  const baseX = roi.x - x1;
-  const baseY = roi.y - y1;
-
-  for (let dy = -SEARCH_MARGIN; dy <= SEARCH_MARGIN; dy += 3) {
-    for (let dx = -SEARCH_MARGIN; dx <= SEARCH_MARGIN; dx += 3) {
-      const s = diceScoreAt(
-        searchBin, sw, sh,
-        baseX + dx,
-        baseY + dy, searchWide, templateWide
-      );
-      if (s > best) { best = s; bestX = dx; bestY = dy; }
-    }
+  // Search only the user-selected band; template dimensions stay unchanged.
+  const maxX=sw-templateW, maxY=sh-templateH;
+  if(maxX<0 || maxY<0) return;
+  for(let y=0;y<=maxY;y+=3) for(let x=0;x<=maxX;x+=3) {
+    const value=diceScoreAt(searchBin,sw,sh,x,y,searchWide,templateWide);
+    if(value>best) {best=value;bestX=x;bestY=y;}
   }
-
-  // Refine the coarse search so thin text is not missed between grid points.
-  const refineX=bestX, refineY=bestY;
-  for(let dy=Math.max(-SEARCH_MARGIN,refineY-2);dy<=Math.min(SEARCH_MARGIN,refineY+2);dy++) {
-    for(let dx=Math.max(-SEARCH_MARGIN,refineX-2);dx<=Math.min(SEARCH_MARGIN,refineX+2);dx++) {
-      best=Math.max(best,diceScoreAt(searchBin,sw,sh,baseX+dx,baseY+dy,searchWide,templateWide));
+  const refineX=bestX,refineY=bestY;
+  for(let y=Math.max(0,refineY-2);y<=Math.min(maxY,refineY+2);y++) {
+    for(let x=Math.max(0,refineX-2);x<=Math.min(maxX,refineX+2);x++) {
+      best=Math.max(best,diceScoreAt(searchBin,sw,sh,x,y,searchWide,templateWide));
     }
   }
   score = best;
@@ -633,6 +652,12 @@ async function showSystemNotification() {
 
 thresholdInput.addEventListener("input", () => {
   thresholdText.textContent = Number(thresholdInput.value).toFixed(2);
+});
+
+regionBtn.addEventListener("click", () => {
+  startTemplateSelection();
+  selectionMode = "region";
+  setState("文字が出る辺りを少し広めに囲んでください", "warn");
 });
 
 cameraBtn.addEventListener("click", startCamera);
