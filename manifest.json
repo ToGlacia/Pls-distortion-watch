@@ -1,0 +1,8 @@
+{
+  "name": "PLA 時空の歪み監視",
+  "short_name": "PLA歪み監視",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000"
+}

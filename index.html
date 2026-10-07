@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.json">
+<title>PLA 歪み監視</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #000;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  }
+  header {
+    padding: 14px 14px 8px;
+    font-size: 21px;
+    font-weight: 700;
+  }
+  .wrap { padding: 0 12px 28px; }
+  .camera {
+    position: relative;
+    width: 100%;
+    background: #111;
+    border-radius: 14px;
+    overflow: hidden;
+    touch-action: none;
+  }
+  #view {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: #111;
+  }
+  .status {
+    margin-top: 10px;
+    padding: 12px;
+    border-radius: 12px;
+    background: #171717;
+    line-height: 1.6;
+    font-size: 15px;
+  }
+  .big {
+    font-size: 24px;
+    font-weight: 800;
+  }
+  .ok { color: #59e36d; }
+  .warn { color: #ffd34e; }
+  .danger { color: #ff5e5e; }
+  .controls {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 9px;
+    margin-top: 10px;
+  }
+  button {
+    min-height: 48px;
+    border: 0;
+    border-radius: 12px;
+    background: #2d2d2d;
+    color: #fff;
+    font-size: 16px;
+    font-weight: 650;
+  }
+  button.primary { background: #0a84ff; }
+  button.stop { background: #a52222; }
+  button:disabled { opacity: .45; }
+  .slider {
+    margin-top: 10px;
+    padding: 12px;
+    border-radius: 12px;
+    background: #171717;
+  }
+  input[type=range] { width: 100%; }
+  #templatePreview {
+    margin-top: 8px;
+    max-width: 100%;
+    max-height: 80px;
+    border: 1px solid #555;
+    display: none;
+  }
+  .help {
+    margin-top: 12px;
+    color: #bbb;
+    font-size: 14px;
+    line-height: 1.65;
+  }
+  #video { display:none; }
+</style>
+</head>
+<body>
+<header>PLA 時空の歪み監視</header>
+<div class="wrap">
+
+  <video id="video" playsinline muted></video>
+
+  <div class="camera">
+    <canvas id="view" width="640" height="360"></canvas>
+  </div>
+
+  <div class="status">
+    <div id="state" class="big warn">停止中</div>
+    <div>一致率: <span id="score">0.000</span></div>
+    <div>連続一致: <span id="hits">0</span> / 3</div>
+    <div>テンプレート: <span id="templateState">未登録</span></div>
+    <img id="templatePreview" alt="登録テンプレート">
+  </div>
+
+  <div class="controls">
+    <button id="cameraBtn" class="primary">① カメラ開始</button>
+    <button id="templateBtn" disabled>② テンプレート登録</button>
+    <button id="monitorBtn" disabled>③ 監視開始</button>
+    <button id="notifyBtn">通知を許可</button>
+    <button id="testBtn">テスト警報</button>
+    <button id="stopAlarmBtn" class="stop">警報停止</button>
+  </div>
+
+  <div class="slider">
+    <div>検知しきい値: <strong id="thresholdText">0.70</strong></div>
+    <input id="threshold" type="range" min="0.40" max="0.95" step="0.01" value="0.70">
+  </div>
+
+  <div class="help">
+    <strong>登録方法</strong><br>
+    「時空の歪みが発生しそうだ」がSwitch画面に出ている状態で
+    「テンプレート登録」を押し、文字の周囲を指でドラッグして囲んでください。<br><br>
+    監視中はiPhoneを固定し、画面を消さないでください。
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const video = document.getElementById("video");
+const view = document.getElementById("view");
+const ctx = view.getContext("2d", { willReadFrequently: true });
+
+const cameraBtn = document.getElementById("cameraBtn");
+const templateBtn = document.getElementById("templateBtn");
+const monitorBtn = document.getElementById("monitorBtn");
+const notifyBtn = document.getElementById("notifyBtn");
+const testBtn = document.getElementById("testBtn");
+const stopAlarmBtn = document.getElementById("stopAlarmBtn");
+
+const stateEl = document.getElementById("state");
+const scoreEl = document.getElementById("score");
+const hitsEl = document.getElementById("hits");
+const templateStateEl = document.getElementById("templateState");
+const templatePreview = document.getElementById("templatePreview");
+const thresholdInput = document.getElementById("threshold");
+const thresholdText = document.getElementById("thresholdText");
+
+const procCanvas = document.createElement("canvas");
+const procCtx = procCanvas.getContext("2d", { willReadFrequently: true });
+
+let stream = null;
+let monitoring = false;
+let selecting = false;
+let drawing = false;
+let startPt = null;
+let currentPt = null;
+let roi = null;
+let templateBinary = null;
+let templateW = 0;
+let templateH = 0;
+
+let score = 0;
+let hits = 0;
+let misses = 0;
+let armed = true;
+let lastProcess = 0;
+
+let audioCtx = null;
+let alarmTimer = null;
+let wakeLock = null;
+
+const PROCESS_WIDTH = 640;
+const PROCESS_INTERVAL = 450;
+const CONSECUTIVE_HITS = 3;
+const REARM_MISSES = 5;
+const SEARCH_MARGIN = 18;
+const WHITE_THRESHOLD = 170;
+
+function setState(text, cls="warn") {
+  stateEl.textContent = text;
+  stateEl.className = "big " + cls;
+}
+
+async function ensureAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === "suspended") {
+    await audioCtx.resume();
+  }
+}
+
+function beep() {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+
+  o.type = "square";
+  o.frequency.value = 880;
+  g.gain.value = 0.22;
+
+  o.connect(g);
+  g.connect(audioCtx.destination);
+
+  const now = audioCtx.currentTime;
+  o.start(now);
+  o.stop(now + 0.22);
+}
+
+async function startAlarm() {
+  await ensureAudio();
+  stopAlarm();
+  beep();
+  alarmTimer = setInterval(beep, 550);
+
+  document.body.style.background = "#4a0000";
+
+  if ("vibrate" in navigator) {
+    try { navigator.vibrate([500,200,500,200,1000]); } catch(e) {}
+  }
+
+  showSystemNotification();
+}
+
+function stopAlarm() {
+  if (alarmTimer) {
+    clearInterval(alarmTimer);
+    alarmTimer = null;
+  }
+  document.body.style.background = "#000";
+}
+
+async function requestWakeLock() {
+  if (!("wakeLock" in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+  } catch (e) {}
+}
+
+document.addEventListener("visibilitychange", async () => {
+  if (document.visibilityState === "visible" && stream) {
+    await requestWakeLock();
+  }
+});
+
+async function startCamera() {
+  try {
+    await ensureAudio();
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: false
+    });
+
+    video.srcObject = stream;
+    await video.play();
+
+    const aspect = video.videoHeight / video.videoWidth;
+    view.width = PROCESS_WIDTH;
+    view.height = Math.round(PROCESS_WIDTH * aspect);
+    procCanvas.width = view.width;
+    procCanvas.height = view.height;
+
+    templateBtn.disabled = false;
+    restoreTemplate();
+    await requestWakeLock();
+
+    setState("カメラ起動中", "ok");
+    cameraBtn.textContent = "カメラ起動済み";
+    cameraBtn.disabled = true;
+
+    requestAnimationFrame(drawLoop);
+  } catch (e) {
+    alert("カメラを開始できませんでした。\nSafariのカメラ許可を確認してください。\n\n" + e);
+  }
+}
+
+function drawLoop(ts) {
+  if (!stream) return;
+
+  procCtx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
+
+  ctx.clearRect(0, 0, view.width, view.height);
+  ctx.drawImage(procCanvas, 0, 0);
+
+  if (roi) {
+    ctx.strokeStyle = monitoring ? "#00ff73" : "#ffd54a";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(roi.x, roi.y, roi.w, roi.h);
+  }
+
+  if (selecting && drawing && startPt && currentPt) {
+    const r = rectFromPoints(startPt, currentPt);
+    ctx.strokeStyle = "#ff3b30";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+  }
+
+  if (monitoring && ts - lastProcess >= PROCESS_INTERVAL) {
+    lastProcess = ts;
+    processFrame();
+  }
+
+  requestAnimationFrame(drawLoop);
+}
+
+function rectFromPoints(a, b) {
+  return {
+    x: Math.min(a.x, b.x),
+    y: Math.min(a.y, b.y),
+    w: Math.abs(a.x - b.x),
+    h: Math.abs(a.y - b.y)
+  };
+}
+
+function pointerToCanvas(e) {
+  const rect = view.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * view.width / rect.width;
+  const y = (e.clientY - rect.top) * view.height / rect.height;
+  return {x, y};
+}
+
+view.addEventListener("pointerdown", e => {
+  if (!selecting) return;
+  e.preventDefault();
+  drawing = true;
+  startPt = pointerToCanvas(e);
+  currentPt = startPt;
+  view.setPointerCapture(e.pointerId);
+});
+
+view.addEventListener("pointermove", e => {
+  if (!selecting || !drawing) return;
+  e.preventDefault();
+  currentPt = pointerToCanvas(e);
+});
+
+view.addEventListener("pointerup", e => {
+  if (!selecting || !drawing) return;
+  e.preventDefault();
+
+  drawing = false;
+  currentPt = pointerToCanvas(e);
+  const r = rectFromPoints(startPt, currentPt);
+
+  if (r.w < 30 || r.h < 12) {
+    alert("範囲が小さすぎます。もう一度囲んでください。");
+    return;
+  }
+
+  roi = {
+    x: Math.round(r.x),
+    y: Math.round(r.y),
+    w: Math.round(r.w),
+    h: Math.round(r.h)
+  };
+
+  createTemplateFromCurrentFrame();
+  selecting = false;
+  setState("テンプレート登録完了", "ok");
+});
+
+function startTemplateSelection() {
+  monitoring = false;
+  monitorBtn.textContent = "③ 監視開始";
+  selecting = true;
+  setState("文字を指で囲んでください", "warn");
+}
+
+function toBinary(imageData) {
+  const src = imageData.data;
+  const out = new Uint8Array(imageData.width * imageData.height);
+
+  for (let i = 0, p = 0; i < src.length; i += 4, p++) {
+    const y = 0.299 * src[i] + 0.587 * src[i+1] + 0.114 * src[i+2];
+    out[p] = y >= WHITE_THRESHOLD ? 1 : 0;
+  }
+
+  return out;
+}
+
+function createTemplateFromCurrentFrame() {
+  const img = procCtx.getImageData(roi.x, roi.y, roi.w, roi.h);
+  templateBinary = toBinary(img);
+  templateW = roi.w;
+  templateH = roi.h;
+
+  const tempCanvas = document.createElement("canvas");
+  tempCanvas.width = roi.w;
+  tempCanvas.height = roi.h;
+  tempCanvas.getContext("2d").putImageData(img, 0, 0);
+
+  const dataUrl = tempCanvas.toDataURL("image/png");
+
+  const data = {
+    roi,
+    dataUrl,
+    canvasW: procCanvas.width,
+    canvasH: procCanvas.height
+  };
+
+  localStorage.setItem("plaTemplate", JSON.stringify(data));
+
+  templatePreview.src = dataUrl;
+  templatePreview.style.display = "block";
+  templateStateEl.textContent = "登録済み";
+  monitorBtn.disabled = false;
+}
+
+function restoreTemplate() {
+  const raw = localStorage.getItem("plaTemplate");
+  if (!raw) return;
+
+  try {
+    const saved = JSON.parse(raw);
+    const sx = procCanvas.width / saved.canvasW;
+    const sy = procCanvas.height / saved.canvasH;
+
+    roi = {
+      x: Math.round(saved.roi.x * sx),
+      y: Math.round(saved.roi.y * sy),
+      w: Math.round(saved.roi.w * sx),
+      h: Math.round(saved.roi.h * sy)
+    };
+
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement("canvas");
+      c.width = roi.w;
+      c.height = roi.h;
+      const cctx = c.getContext("2d", { willReadFrequently: true });
+      cctx.drawImage(img, 0, 0, roi.w, roi.h);
+
+      const id = cctx.getImageData(0, 0, roi.w, roi.h);
+      templateBinary = toBinary(id);
+      templateW = roi.w;
+      templateH = roi.h;
+
+      templatePreview.src = saved.dataUrl;
+      templatePreview.style.display = "block";
+      templateStateEl.textContent = "登録済み";
+      monitorBtn.disabled = false;
+    };
+    img.src = saved.dataUrl;
+  } catch(e) {
+    localStorage.removeItem("plaTemplate");
+  }
+}
+
+function diceScoreAt(searchBin, searchW, searchH, tx, ty) {
+  let inter = 0;
+  let a = 0;
+  let b = 0;
+
+  for (let y = 0; y < templateH; y++) {
+    const sy = ty + y;
+    if (sy < 0 || sy >= searchH) continue;
+
+    const tRow = y * templateW;
+    const sRow = sy * searchW;
+
+    for (let x = 0; x < templateW; x++) {
+      const sx = tx + x;
+      if (sx < 0 || sx >= searchW) continue;
+
+      const tv = templateBinary[tRow + x];
+      const sv = searchBin[sRow + sx];
+
+      a += tv;
+      b += sv;
+      if (tv && sv) inter++;
+    }
+  }
+
+  if (a + b === 0) return 0;
+  return (2 * inter) / (a + b);
+}
+
+function processFrame() {
+  if (!roi || !templateBinary) return;
+
+  const x1 = Math.max(0, roi.x - SEARCH_MARGIN);
+  const y1 = Math.max(0, roi.y - SEARCH_MARGIN);
+  const x2 = Math.min(procCanvas.width, roi.x + roi.w + SEARCH_MARGIN);
+  const y2 = Math.min(procCanvas.height, roi.y + roi.h + SEARCH_MARGIN);
+
+  const sw = x2 - x1;
+  const sh = y2 - y1;
+
+  const imageData = procCtx.getImageData(x1, y1, sw, sh);
+  const searchBin = toBinary(imageData);
+
+  let best = 0;
+
+  const baseX = roi.x - x1;
+  const baseY = roi.y - y1;
+
+  for (let dy = -SEARCH_MARGIN; dy <= SEARCH_MARGIN; dy += 3) {
+    for (let dx = -SEARCH_MARGIN; dx <= SEARCH_MARGIN; dx += 3) {
+      const s = diceScoreAt(
+        searchBin, sw, sh,
+        baseX + dx,
+        baseY + dy
+      );
+      if (s > best) best = s;
+    }
+  }
+
+  score = best;
+  scoreEl.textContent = score.toFixed(3);
+
+  const threshold = Number(thresholdInput.value);
+
+  if (score >= threshold) {
+    hits++;
+    misses = 0;
+  } else {
+    hits = 0;
+    misses++;
+
+    if (misses >= REARM_MISSES) {
+      armed = true;
+    }
+  }
+
+  hitsEl.textContent = hits;
+
+  if (hits >= CONSECUTIVE_HITS && armed) {
+    armed = false;
+    setState("時空の歪みが発生しそうです！", "danger");
+    startAlarm();
+  }
+}
+
+function toggleMonitoring() {
+  if (!templateBinary) {
+    alert("先にテンプレートを登録してください。");
+    return;
+  }
+
+  monitoring = !monitoring;
+  hits = 0;
+  misses = 0;
+  armed = true;
+
+  if (monitoring) {
+    monitorBtn.textContent = "監視停止";
+    setState("監視中", "ok");
+    requestWakeLock();
+  } else {
+    monitorBtn.textContent = "③ 監視開始";
+    setState("監視停止", "warn");
+  }
+}
+
+async function askNotification() {
+  if (!("Notification" in window)) {
+    alert("この状態では通知機能を利用できません。\nSafariの共有メニューから「ホーム画面に追加」して、ホーム画面から起動してください。\n警報音は通知許可なしでも使えます。");
+    return;
+  }
+
+  try {
+    const p = await Notification.requestPermission();
+    alert("通知設定: " + p);
+  } catch (e) {
+    alert("通知許可に失敗しました。\nホーム画面に追加してから再度お試しください。");
+  }
+}
+
+async function showSystemNotification() {
+  try {
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    if (!("serviceWorker" in navigator)) return;
+
+    const reg = await navigator.serviceWorker.ready;
+    await reg.showNotification(
+      "Pokémon Legends アルセウス",
+      {
+        body: "時空の歪みが発生しそうです！",
+        tag: "pla-distortion"
+      }
+    );
+  } catch (e) {}
+}
+
+thresholdInput.addEventListener("input", () => {
+  thresholdText.textContent = Number(thresholdInput.value).toFixed(2);
+});
+
+cameraBtn.addEventListener("click", startCamera);
+templateBtn.addEventListener("click", startTemplateSelection);
+monitorBtn.addEventListener("click", toggleMonitoring);
+notifyBtn.addEventListener("click", askNotification);
+
+testBtn.addEventListener("click", async () => {
+  await ensureAudio();
+  setState("テスト警報", "danger");
+  await startAlarm();
+});
+
+stopAlarmBtn.addEventListener("click", () => {
+  stopAlarm();
+  if (monitoring) setState("監視中", "ok");
+  else setState("停止中", "warn");
+});
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("./sw.js").catch(() => {});
+  });
+}
+</script>
+</body>
+</html>
