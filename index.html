@@ -33,11 +33,8 @@
   }
   #view {
     display: block;
-    width: auto;
+    width: 100%;
     height: auto;
-    max-width: 100%;
-    max-height: 150px;
-    margin: 0 auto;
     background: #111;
   }
   .status {
@@ -97,7 +94,7 @@
 </style>
 </head>
 <body>
-<header>PLA 時空の歪み監視 v4</header>
+<header>PLA 時空の歪み監視</header>
 <div class="wrap">
 
   <video id="video" playsinline muted></video>
@@ -117,7 +114,6 @@
   <div class="controls">
     <button id="cameraBtn" class="primary">① カメラ開始</button>
     <button id="templateBtn" disabled>② テンプレート登録</button>
-    <button id="regionBtn" disabled>文字を探す範囲を設定</button>
     <button id="monitorBtn" disabled>③ 監視開始</button>
     <button id="notifyBtn">通知を許可</button>
     <button id="testBtn">テスト警報</button>
@@ -125,18 +121,15 @@
   </div>
 
   <div class="slider">
-    <div>検知しきい値: <strong id="thresholdText">0.65</strong></div>
-    <input id="threshold" type="range" min="0.50" max="0.99" step="0.01" value="0.65">
+    <div>検知しきい値: <strong id="thresholdText">0.70</strong></div>
+    <input id="threshold" type="range" min="0.40" max="0.95" step="0.01" value="0.70">
   </div>
 
   <div class="help">
-    <strong>設定手順</strong><br>
-    ① 小さなカメラ表示にSwitch画面全体が収まる位置で固定してください。<br>
-    ② 文字が出ているときに「テンプレート登録」を押し、文字だけを囲んでください。<br>
-    ③ 「文字を探す範囲を設定」を押し、文字が出る辺りを少し広めに囲んでください。指定範囲の中だけで探します。<br>
-    ④ 監視開始。登録・範囲設定後の枠は消えます。<br><br>
-    しきい値はまず0.65。範囲設定はカメラ起動・テンプレート登録後に行ってください。
-    カメラ位置や距離を変えたら再登録してください。監視中は画面を消さないでください。
+    <strong>登録方法</strong><br>
+    「時空の歪みが発生しそうだ」がSwitch画面に出ている状態で
+    「テンプレート登録」を押し、文字の周囲を指でドラッグして囲んでください。<br><br>
+    監視中はiPhoneを固定し、画面を消さないでください。
   </div>
 </div>
 
@@ -148,7 +141,6 @@ const view = document.getElementById("view");
 const ctx = view.getContext("2d", { willReadFrequently: true });
 
 const cameraBtn = document.getElementById("cameraBtn");
-const regionBtn = document.getElementById("regionBtn");
 const templateBtn = document.getElementById("templateBtn");
 const monitorBtn = document.getElementById("monitorBtn");
 const notifyBtn = document.getElementById("notifyBtn");
@@ -169,8 +161,6 @@ const procCtx = procCanvas.getContext("2d", { willReadFrequently: true });
 let stream = null;
 let monitoring = false;
 let selecting = false;
-let selectionMode = "template";
-let searchRegion = null;
 let drawing = false;
 let startPt = null;
 let currentPt = null;
@@ -302,10 +292,16 @@ async function startCamera() {
 function drawLoop(ts) {
   if (!stream) return;
 
-  if (!selecting) procCtx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
+  procCtx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
 
   ctx.clearRect(0, 0, view.width, view.height);
   ctx.drawImage(procCanvas, 0, 0);
+
+  if (roi) {
+    ctx.strokeStyle = monitoring ? "#00ff73" : "#ffd54a";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(roi.x, roi.y, roi.w, roi.h);
+  }
 
   if (selecting && drawing && startPt && currentPt) {
     const r = rectFromPoints(startPt, currentPt);
@@ -335,7 +331,7 @@ function pointerToCanvas(e) {
   const rect = view.getBoundingClientRect();
   const x = (e.clientX - rect.left) * view.width / rect.width;
   const y = (e.clientY - rect.top) * view.height / rect.height;
-  return {x: Math.max(0, Math.min(view.width, x)), y: Math.max(0, Math.min(view.height, y))};
+  return {x, y};
 }
 
 view.addEventListener("pointerdown", e => {
@@ -366,18 +362,6 @@ view.addEventListener("pointerup", e => {
     return;
   }
 
-  if (selectionMode === "region") {
-    const candidate = { x: Math.floor(r.x), y: Math.floor(r.y), w: Math.floor(r.w), h: Math.floor(r.h) };
-    if (candidate.w < templateW || candidate.h < templateH) {
-      alert("登録した文字画像が入るように、少し広く囲んでください。");
-      return;
-    }
-    searchRegion = candidate;
-    selecting = false;
-    startPt = currentPt = null;
-    setState("検索範囲を設定しました", "ok");
-    return;
-  }
   roi = {
     x: Math.round(r.x),
     y: Math.round(r.y),
@@ -385,61 +369,33 @@ view.addEventListener("pointerup", e => {
     h: Math.round(r.h)
   };
 
-  if (!createTemplateFromCurrentFrame()) return;
+  createTemplateFromCurrentFrame();
   selecting = false;
-  startPt = currentPt = null;
   setState("テンプレート登録完了", "ok");
 });
 
 function startTemplateSelection() {
   monitoring = false;
-  stopAlarm();
-  hits = misses = 0;
-  armed = true;
-  drawing = false;
-  startPt = currentPt = null;
   monitorBtn.textContent = "③ 監視開始";
-  selectionMode = "template";
   selecting = true;
   setState("文字を指で囲んでください", "warn");
 }
 
-// Extract locally bright strokes; absolute brightness alone also matches sky.
 function toBinary(imageData) {
-  const {width:w, height:h, data:src} = imageData;
-  const gray = new Float32Array(w*h);
-  const integral = new Float64Array((w+1)*(h+1));
-  for (let y=0; y<h; y++) {
-    let row=0;
-    for (let x=0; x<w; x++) {
-      const p=y*w+x, i=p*4;
-      gray[p]=0.299*src[i]+0.587*src[i+1]+0.114*src[i+2];
-      row+=gray[p];
-      integral[(y+1)*(w+1)+x+1]=integral[y*(w+1)+x+1]+row;
-    }
+  const src = imageData.data;
+  const out = new Uint8Array(imageData.width * imageData.height);
+
+  for (let i = 0, p = 0; i < src.length; i += 4, p++) {
+    const y = 0.299 * src[i] + 0.587 * src[i+1] + 0.114 * src[i+2];
+    out[p] = y >= WHITE_THRESHOLD ? 1 : 0;
   }
-  const out=new Uint8Array(w*h), radius=4;
-  for (let y=0; y<h; y++) for (let x=0; x<w; x++) {
-    const x1=Math.max(0,x-radius), x2=Math.min(w,x+radius+1);
-    const y1=Math.max(0,y-radius), y2=Math.min(h,y+radius+1);
-    const sum=integral[y2*(w+1)+x2]-integral[y1*(w+1)+x2]
-      -integral[y2*(w+1)+x1]+integral[y1*(w+1)+x1];
-    const mean=sum/((x2-x1)*(y2-y1));
-    out[y*w+x]=(gray[y*w+x]>=150 && gray[y*w+x]-mean>=12)?1:0;
-  }
+
   return out;
 }
 
 function createTemplateFromCurrentFrame() {
   const img = procCtx.getImageData(roi.x, roi.y, roi.w, roi.h);
-  const candidate = toBinary(img);
-  const density = candidate.reduce((a,b)=>a+b,0)/candidate.length;
-  if (density < 0.015 || density > 0.45) {
-    alert("文字の輪郭が不足しています。文字が表示されているときに、文字の周囲を狭めに囲んでください。");
-    return false;
-  }
-  templateBinary = candidate;
-  searchRegion = null;
+  templateBinary = toBinary(img);
   templateW = roi.w;
   templateH = roi.h;
 
@@ -451,21 +407,18 @@ function createTemplateFromCurrentFrame() {
   const dataUrl = tempCanvas.toDataURL("image/png");
 
   const data = {
-    version: 2,
     roi,
     dataUrl,
     canvasW: procCanvas.width,
     canvasH: procCanvas.height
   };
 
-  try { localStorage.setItem("plaTemplate", JSON.stringify(data)); } catch(e) {}
+  localStorage.setItem("plaTemplate", JSON.stringify(data));
 
   templatePreview.src = dataUrl;
   templatePreview.style.display = "block";
   templateStateEl.textContent = "登録済み";
   monitorBtn.disabled = false;
-  regionBtn.disabled = false;
-  return true;
 }
 
 function restoreTemplate() {
@@ -474,10 +427,6 @@ function restoreTemplate() {
 
   try {
     const saved = JSON.parse(raw);
-    if (saved.version !== 2) {
-      templateStateEl.textContent = "再登録してください（判定方式を更新）";
-      return;
-    }
     const sx = procCanvas.width / saved.canvasW;
     const sy = procCanvas.height / saved.canvasH;
 
@@ -505,7 +454,6 @@ function restoreTemplate() {
       templatePreview.style.display = "block";
       templateStateEl.textContent = "登録済み";
       monitorBtn.disabled = false;
-  regionBtn.disabled = false;
     };
     img.src = saved.dataUrl;
   } catch(e) {
@@ -513,40 +461,42 @@ function restoreTemplate() {
   }
 }
 
-// Symmetric stroke matching with one-pixel tolerance; extra background
-// strokes reduce precision instead of increasing the score.
-function dilateMask(mask, w, h) {
-  const out = new Uint8Array(mask.length);
-  for (let y=0;y<h;y++) for(let x=0;x<w;x++) {
-    if (!mask[y*w+x]) continue;
-    for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++) {
-      const xx=x+dx, yy=y+dy;
-      if(xx>=0 && yy>=0 && xx<w && yy<h) out[yy*w+xx]=1;
+function diceScoreAt(searchBin, searchW, searchH, tx, ty) {
+  let inter = 0;
+  let a = 0;
+  let b = 0;
+
+  for (let y = 0; y < templateH; y++) {
+    const sy = ty + y;
+    if (sy < 0 || sy >= searchH) continue;
+
+    const tRow = y * templateW;
+    const sRow = sy * searchW;
+
+    for (let x = 0; x < templateW; x++) {
+      const sx = tx + x;
+      if (sx < 0 || sx >= searchW) continue;
+
+      const tv = templateBinary[tRow + x];
+      const sv = searchBin[sRow + sx];
+
+      a += tv;
+      b += sv;
+      if (tv && sv) inter++;
     }
   }
-  return out;
-}
-function diceScoreAt(searchBin, searchW, searchH, tx, ty, searchWide, templateWide) {
-  if(tx<0 || ty<0 || tx+templateW>searchW || ty+templateH>searchH) return 0;
-  let a=0,b=0,matchedA=0,matchedB=0;
-  for(let y=0;y<templateH;y++) for(let x=0;x<templateW;x++) {
-    const t=y*templateW+x, q=(ty+y)*searchW+tx+x;
-    if(templateBinary[t]) {a++; matchedA+=searchWide[q];}
-    if(searchBin[q]) {b++; matchedB+=templateWide[t];}
-  }
-  if(!a || !b) return 0;
-  const recall=matchedA/a, precision=matchedB/b;
-  return recall+precision ? 2*recall*precision/(recall+precision) : 0;
+
+  if (a + b === 0) return 0;
+  return (2 * inter) / (a + b);
 }
 
 function processFrame() {
   if (!roi || !templateBinary) return;
 
-  const region = searchRegion || {x:roi.x-SEARCH_MARGIN, y:roi.y-SEARCH_MARGIN, w:roi.w+SEARCH_MARGIN*2, h:roi.h+SEARCH_MARGIN*2};
-  const x1 = Math.max(0, region.x);
-  const y1 = Math.max(0, region.y);
-  const x2 = Math.min(procCanvas.width, region.x + region.w);
-  const y2 = Math.min(procCanvas.height, region.y + region.h);
+  const x1 = Math.max(0, roi.x - SEARCH_MARGIN);
+  const y1 = Math.max(0, roi.y - SEARCH_MARGIN);
+  const x2 = Math.min(procCanvas.width, roi.x + roi.w + SEARCH_MARGIN);
+  const y2 = Math.min(procCanvas.height, roi.y + roi.h + SEARCH_MARGIN);
 
   const sw = x2 - x1;
   const sh = y2 - y1;
@@ -554,30 +504,29 @@ function processFrame() {
   const imageData = procCtx.getImageData(x1, y1, sw, sh);
   const searchBin = toBinary(imageData);
 
-  const searchWide = dilateMask(searchBin, sw, sh);
-  const templateWide = dilateMask(templateBinary, templateW, templateH);
-  let best = 0, bestX = 0, bestY = 0;
+  let best = 0;
 
-  // Search only the user-selected band; template dimensions stay unchanged.
-  const maxX=sw-templateW, maxY=sh-templateH;
-  if(maxX<0 || maxY<0) return;
-  for(let y=0;y<=maxY;y+=3) for(let x=0;x<=maxX;x+=3) {
-    const value=diceScoreAt(searchBin,sw,sh,x,y,searchWide,templateWide);
-    if(value>best) {best=value;bestX=x;bestY=y;}
-  }
-  const refineX=bestX,refineY=bestY;
-  for(let y=Math.max(0,refineY-2);y<=Math.min(maxY,refineY+2);y++) {
-    for(let x=Math.max(0,refineX-2);x<=Math.min(maxX,refineX+2);x++) {
-      best=Math.max(best,diceScoreAt(searchBin,sw,sh,x,y,searchWide,templateWide));
+  const baseX = roi.x - x1;
+  const baseY = roi.y - y1;
+
+  for (let dy = -SEARCH_MARGIN; dy <= SEARCH_MARGIN; dy += 3) {
+    for (let dx = -SEARCH_MARGIN; dx <= SEARCH_MARGIN; dx += 3) {
+      const s = diceScoreAt(
+        searchBin, sw, sh,
+        baseX + dx,
+        baseY + dy
+      );
+      if (s > best) best = s;
     }
   }
+
   score = best;
   scoreEl.textContent = score.toFixed(3);
 
   const threshold = Number(thresholdInput.value);
 
   if (score >= threshold) {
-    hits = Math.min(hits + 1, CONSECUTIVE_HITS);
+    hits++;
     misses = 0;
   } else {
     hits = 0;
@@ -603,9 +552,7 @@ function toggleMonitoring() {
     return;
   }
 
-  if (selecting) return;
   monitoring = !monitoring;
-  if (!monitoring) stopAlarm();
   hits = 0;
   misses = 0;
   armed = true;
@@ -652,12 +599,6 @@ async function showSystemNotification() {
 
 thresholdInput.addEventListener("input", () => {
   thresholdText.textContent = Number(thresholdInput.value).toFixed(2);
-});
-
-regionBtn.addEventListener("click", () => {
-  startTemplateSelection();
-  selectionMode = "region";
-  setState("文字が出る辺りを少し広めに囲んでください", "warn");
 });
 
 cameraBtn.addEventListener("click", startCamera);
