@@ -1,4 +1,4 @@
-const CACHE = "pla-watch-v4-full";
+const CACHE = "pla-watch-v4-ntfy-visible-region";
 
 self.addEventListener("install", event => {
   self.skipWaiting();
