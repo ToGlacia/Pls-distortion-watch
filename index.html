@@ -94,7 +94,7 @@
 </style>
 </head>
 <body>
-<header>PLA 時空の歪み監視 v4＋ntfy</header>
+<header>PLA 時空の歪み監視 v4＋ntfy＋Pico</header>
 <div class="wrap">
 
   <video id="video" playsinline muted></video>
@@ -129,6 +129,35 @@
     <div id="ntfyStatus" role="status">未設定</div>
     <div class="help">受信端末のntfyで、サーバー「https://ntfy.sh」と同じトピック名を登録してください。トピック名は推測されにくい長い名前にしてください。</div>
   </div>
+  <div class="slider" id="picoPanel">
+    <strong>Pico 2 W：自動スリープ（MQTT）</strong>
+    <div class="help">GitHub PagesからPicoへはMQTT（暗号化WebSocket）で送信します。PicoのBluetooth接続が必要です。</div>
+    <label for="picoChannel">MQTTトピック末尾（WifiConfig.hのPICO_MQTT_TOPIC_SUFFIX）</label>
+    <input id="picoChannel" type="text" maxlength="40" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="24～40文字の小文字16進数" style="width:100%;padding:10px;margin:8px 0;font-size:16px">
+    <label for="picoToken">MQTT認証キー（PICO_MQTT_AUTH_TOKEN）</label>
+    <input id="picoToken" type="password" autocomplete="off" spellcheck="false" placeholder="16文字以上" style="width:100%;padding:10px;margin:8px 0;font-size:16px">
+    <div class="controls">
+      <button id="picoConnectBtn">MQTT接続</button>
+      <button id="picoDisconnectBtn">切断</button>
+    </div>
+    <div id="picoStatus" role="status">MQTT未接続</div>
+    <p class="help">認証キーはGitHubに書き込みません。このiPhoneのブラウザー内に保存されます。共用端末には入力しないでください。ブローカーは公開サービスのため、実機の状態まで保証しません。</p>
+    <label for="picoDowns">クイック設定で「スリープ」を選ぶまでの↓操作回数</label>
+    <select id="picoDowns" style="width:100%;padding:12px;margin:8px 0;background:#333;color:#fff;font-size:16px">
+      <option value="0">0回（現在の選択位置でAを押す）</option>
+      <option value="1">1回</option>
+      <option value="2">2回</option>
+      <option value="3">3回</option>
+      <option value="4">4回</option>
+      <option value="5">5回</option>
+    </select>
+    <div class="controls">
+      <button id="picoMenuTestBtn" disabled>HOME長押しテスト</button>
+      <button id="picoFullTestBtn" disabled>スリープ操作テスト</button>
+    </div>
+    <label style="display:block;margin-top:12px"><input id="picoAutoSleep" type="checkbox"> 検知時にSwitch Liteの自動スリープを実行する（初期OFF）</label>
+    <div class="help">まずHOME長押しテストでクイック設定を開き、スリープが選択される操作回数を実機で確認してください。「テスト警報」ボタンではPicoへ命令を送りません。実検知時だけ自動実行します。</div>
+  </div>
   <div class="slider">
     <div>検知しきい値: <strong id="thresholdText">0.65</strong></div>
     <input id="threshold" type="range" min="0.50" max="0.99" step="0.01" value="0.65">
@@ -145,6 +174,7 @@
   </div>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.14.1/mqtt.min.js"></script>
 <script>
 "use strict";
 
@@ -244,6 +274,119 @@ ntfyTestBtn.addEventListener("click", async () => {
   ntfyTestBtn.disabled = true;
   try { await sendNtfy(true); } finally { ntfyTestBtn.disabled = false; }
 });
+
+// MQTT control for Pico 2 W. Credentials are never embedded in GitHub source.
+const picoChannel = document.getElementById("picoChannel");
+const picoToken = document.getElementById("picoToken");
+const picoConnectBtn = document.getElementById("picoConnectBtn");
+const picoDisconnectBtn = document.getElementById("picoDisconnectBtn");
+const picoMenuTestBtn = document.getElementById("picoMenuTestBtn");
+const picoFullTestBtn = document.getElementById("picoFullTestBtn");
+const picoAutoSleep = document.getElementById("picoAutoSleep");
+const picoDowns = document.getElementById("picoDowns");
+const picoStatus = document.getElementById("picoStatus");
+let picoMqtt = null;
+let picoReady = false;
+let picoLastAutoAt = 0;
+
+function picoStore(key, value) {
+  try { localStorage.setItem(key, value); } catch(e) {}
+}
+function picoLoad(key, fallback="") {
+  try { return localStorage.getItem(key) ?? fallback; } catch(e) { return fallback; }
+}
+picoChannel.value = picoLoad("plaPicoMqttSuffix");
+picoToken.value = picoLoad("plaPicoMqttToken");
+picoDowns.value = picoLoad("plaPicoSleepDowns", "0");
+// Deliberately OFF on every page load; requires explicit re-enabling.
+picoAutoSleep.checked = false;
+picoChannel.addEventListener("change", () => picoStore("plaPicoMqttSuffix",picoChannel.value.trim()));
+picoToken.addEventListener("change", () => picoStore("plaPicoMqttToken",picoToken.value));
+picoDowns.addEventListener("change", () => picoStore("plaPicoSleepDowns",picoDowns.value));
+
+function picoSettings() {
+  const suffix=picoChannel.value.trim();
+  const token=picoToken.value;
+  if(!/^[a-f0-9]{24,40}$/.test(suffix)) throw Error("MQTTトピック末尾は24～40文字の小文字16進数で入力してください。");
+  if(token.length < 16 || /[|\r\n]/.test(token)) throw Error("MQTT認証キーは16文字以上で、縦線や改行を含めないでください。");
+  return {topic:"pla/remote/"+suffix,token};
+}
+function picoUi(status) {
+  picoStatus.textContent=status;
+  picoMenuTestBtn.disabled=!picoReady;
+  picoFullTestBtn.disabled=!picoReady;
+}
+function picoDisconnect() {
+  picoReady=false;
+  const c=picoMqtt;
+  picoMqtt=null;
+  if(c) { try {c.end(true);} catch(e) {} }
+  picoUi("MQTT切断");
+}
+picoDisconnectBtn.addEventListener("click", picoDisconnect);
+picoConnectBtn.addEventListener("click", () => {
+  let settings;
+  try {
+    settings=picoSettings();
+    if(!window.mqtt) throw Error("MQTTライブラリが読み込めません（ネット接続を確認）。");
+  } catch(e) {picoUi("接続できません："+e.message);return;}
+  picoStore("plaPicoMqttSuffix",picoChannel.value.trim());
+  picoStore("plaPicoMqttToken",picoToken.value);
+  picoDisconnect();
+  picoUi("MQTT接続中…");
+  const c=window.mqtt.connect("wss://broker.emqx.io:8084/mqtt", {
+    protocolVersion:4,clean:true,keepalive:30,reconnectPeriod:4000,connectTimeout:12000,
+    clientId:"pla-iphone-"+Math.random().toString(16).slice(2,12)
+  });
+  picoMqtt=c;
+  c.on("connect",()=>{ if(picoMqtt===c){picoReady=true;picoUi("MQTT接続中（Pico側のMQTTもREADYか確認）");} });
+  c.on("close",()=>{ if(picoMqtt===c){picoReady=false;picoUi("MQTT接続が切れました・再接続待ち");} });
+  c.on("error",()=>{ if(picoMqtt===c){picoReady=false;picoUi("MQTT通信エラー（接続先を確認）");} });
+});
+function picoPublishSleep(mode) {
+  return new Promise((resolve,reject)=>{
+    let s;
+    try{s=picoSettings();}catch(e){reject(e);return;}
+    if(!picoReady || !picoMqtt || !picoMqtt.connected){reject(Error("MQTT接続がありません"));return;}
+    // QoS0, retain=false: the broker should not replay a past sleep command.
+    picoMqtt.publish(s.topic, "SLEEP|"+mode+"|"+s.token,
+      {qos:0,retain:false},err=>err?reject(err):resolve());
+  });
+}
+picoMenuTestBtn.addEventListener("click", async()=>{
+  if(!confirm("Switch Liteのゲームを安全な状態にしてください。HOMEを約1.5秒長押しし、クイック設定を表示します。実行しますか？")) return;
+  picoMenuTestBtn.disabled=true;
+  try {
+    await picoPublishSleep("menu");
+    picoUi("HOME長押しを送信しました（Pico実行はSwitch画面で確認）");
+  } catch(e) {picoUi("送信失敗："+e.message);}
+  finally {picoMenuTestBtn.disabled=!picoReady;}
+});
+picoFullTestBtn.addEventListener("click",async()=>{
+  const downs=Number(picoDowns.value);
+  if(!Number.isInteger(downs)||downs<0||downs>5) {picoUi("↓回数を確認してください");return;}
+  if(!confirm("Switch Liteをスリープさせる操作を実行します。HOME長押し → ↓"+downs+"回 → A。選択先を確認済みですか？")) return;
+  picoFullTestBtn.disabled=true;
+  try {
+    await picoPublishSleep("full"+downs);
+    picoUi("スリープ操作を送信しました（本体で結果を確認してください）");
+  } catch(e) {picoUi("送信失敗："+e.message);}
+  finally {picoFullTestBtn.disabled=!picoReady;}
+});
+picoAutoSleep.addEventListener("change",()=>{
+  if(picoAutoSleep.checked && !confirm("実際の時空の歪み検知で、自動的にSwitch Liteへスリープ操作を送信します。HOME長押しと↓回数の動作確認は完了していますか？")) picoAutoSleep.checked=false;
+});
+function picoSendOnDetection() {
+  if(!picoAutoSleep.checked) return;
+  if(!picoReady){picoUi("歪み検知：MQTT未接続のためスリープ命令を送れませんでした");return;}
+  const now=Date.now();
+  if(now-picoLastAutoAt<120000){picoUi("歪み検知：2分以内のスリープ再送信を省略");return;}
+  picoLastAutoAt=now;
+  const downs=Number(picoDowns.value);
+  void picoPublishSleep("full"+downs)
+    .then(()=>picoUi("歪み検知：自動スリープ命令を送信（Pico/本体の実行は未確認）"))
+    .catch(e=>picoUi("歪み検知：スリープ送信失敗："+e.message));
+}
 
 function setState(text, cls="warn") {
   stateEl.textContent = text;
@@ -657,6 +800,7 @@ function processFrame() {
   if (hits >= CONSECUTIVE_HITS && armed) {
     armed = false;
     setState("時空の歪みが発生しそうです！", "danger");
+    picoSendOnDetection();
     startAlarm();
   }
 }
