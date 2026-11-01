@@ -156,6 +156,9 @@
       <button id="picoFullTestBtn" disabled>スリープ操作テスト</button>
     </div>
     <label style="display:block;margin-top:12px"><input id="picoAutoSleep" type="checkbox"> 検知時にSwitch Liteの自動スリープを実行する（初期OFF）</label>
+    <label style="display:block;margin-top:12px"><input id="picoIdleSleep" type="checkbox" checked> 40分間、時空の歪みを検知しなければスリープのみ実行</label>
+    <div id="picoIdleCountdown" class="help" role="status" aria-live="off">40分タイマー：監視開始後に計測</div>
+    <div class="help">40分機能は上の「検知時に自動スリープ」とMQTT接続がONのときに動作します。監視開始または最後の歪み検知から40分の未検知で1回だけスリープ命令を送信します。40分時は警報音・ntfy通知なし。監視停止・Safariの非表示・MQTT切断中は時間をカウントしません。監視を停止して再開するとタイマーがリセットされます。</div>
     <div class="help">まずHOME長押しテストでクイック設定を開き、スリープが選択される操作回数を実機で確認してください。「テスト警報」ボタンではPicoへ命令を送りません。実検知時だけ自動実行します。</div>
   </div>
   <div class="slider">
@@ -283,6 +286,8 @@ const picoDisconnectBtn = document.getElementById("picoDisconnectBtn");
 const picoMenuTestBtn = document.getElementById("picoMenuTestBtn");
 const picoFullTestBtn = document.getElementById("picoFullTestBtn");
 const picoAutoSleep = document.getElementById("picoAutoSleep");
+const picoIdleSleep = document.getElementById("picoIdleSleep");
+const picoIdleCountdown = document.getElementById("picoIdleCountdown");
 const picoDowns = document.getElementById("picoDowns");
 const picoStatus = document.getElementById("picoStatus");
 let picoMqtt = null;
@@ -300,6 +305,12 @@ picoToken.value = picoLoad("plaPicoMqttToken");
 picoDowns.value = picoLoad("plaPicoSleepDowns", "0");
 // Deliberately OFF on every page load; requires explicit re-enabling.
 picoAutoSleep.checked = false;
+// 40-minute fallback is available by default, but it never runs while auto-sleep is OFF.
+picoIdleSleep.checked = picoLoad("plaPicoIdleSleep", "true") === "true";
+picoIdleSleep.addEventListener("change", () => {
+  picoStore("plaPicoIdleSleep", String(picoIdleSleep.checked));
+  picoResetIdleTimer();
+});
 picoChannel.addEventListener("change", () => picoStore("plaPicoMqttSuffix",picoChannel.value.trim()));
 picoToken.addEventListener("change", () => picoStore("plaPicoMqttToken",picoToken.value));
 picoDowns.addEventListener("change", () => picoStore("plaPicoSleepDowns",picoDowns.value));
@@ -375,7 +386,83 @@ picoFullTestBtn.addEventListener("click",async()=>{
 });
 picoAutoSleep.addEventListener("change",()=>{
   if(picoAutoSleep.checked && !confirm("実際の時空の歪み検知で、自動的にSwitch Liteへスリープ操作を送信します。HOME長押しと↓回数の動作確認は完了していますか？")) picoAutoSleep.checked=false;
+  picoResetIdleTimer();
 });
+
+// Track *active, visible* monitoring time. Backgrounded/locked Safari, stopped
+// camera, disconnected MQTT and suspended frames must not count as 40 minutes.
+const PICO_IDLE_SLEEP_MS = 40 * 60 * 1000;
+let picoIdleElapsedMs = 0;
+let picoIdleLastTs = null;
+let picoIdleFired = false;
+let picoIdleDisplayedSecond = -1;
+
+function picoIdleLabel() {
+  if (!picoIdleSleep.checked) return "40分未検知スリープ：OFF";
+  if (!picoAutoSleep.checked) return "40分未検知スリープ：自動スリープをONにすると有効";
+  if (!monitoring) return "40分タイマー：監視開始待ち";
+  if (picoIdleFired) return "40分未検知：スリープ命令の送信を1回試行済み（監視を再開するとリセット）";
+  if (!picoReady) return "40分タイマー：MQTT接続待ち（停止中）";
+  if (document.visibilityState !== "visible") return "40分タイマー：画面が非表示のため停止中";
+  const seconds = Math.ceil(Math.max(0, PICO_IDLE_SLEEP_MS - picoIdleElapsedMs) / 1000);
+  return "未検知の残り時間：" + String(Math.floor(seconds / 60)).padStart(2,"0") + ":" + String(seconds % 60).padStart(2,"0");
+}
+function picoRenderIdle() {
+  picoIdleCountdown.textContent = picoIdleLabel();
+}
+function picoResetIdleTimer() {
+  picoIdleElapsedMs = 0;
+  picoIdleLastTs = null;
+  picoIdleFired = false;
+  picoIdleDisplayedSecond = -1;
+  picoRenderIdle();
+}
+function picoTickIdleTimer(ts) {
+  const active = monitoring && !!stream && video.readyState >= 2 &&
+    !selecting && document.visibilityState === "visible" &&
+    picoAutoSleep.checked && picoIdleSleep.checked && picoReady && !picoIdleFired;
+  if (!active) {
+    picoIdleLastTs = null;
+    // Only render when this check changes the visible label.
+    const label = picoIdleLabel();
+    if (picoIdleCountdown.textContent !== label) picoIdleCountdown.textContent = label;
+    return;
+  }
+  if (picoIdleLastTs !== null) {
+    const delta = ts - picoIdleLastTs;
+    // Large gaps indicate Safari was suspended or the camera stalled.
+    if (delta > 0 && delta <= 10000) picoIdleElapsedMs += delta;
+  }
+  picoIdleLastTs = ts;
+  if (picoIdleElapsedMs >= PICO_IDLE_SLEEP_MS) {
+    picoIdleFired = true;  // Exactly once, even if publish fails; explicit restart to retry.
+    picoIdleLastTs = null;
+    const now = Date.now();
+    if (now - picoLastAutoAt < 120000) {
+      picoUi("40分未検知：既存の2分間の再送信制限で省略しました");
+    } else {
+      picoLastAutoAt = now;
+      const downs = Number(picoDowns.value);
+      if (!Number.isInteger(downs) || downs < 0 || downs > 5) {
+        picoUi("40分未検知：↓回数が無効なため送信しませんでした");
+      } else {
+        // Timeout is a silent fail-safe: no alarm and no ntfy notification.
+        picoUi("40分未検知：スリープ命令を送信中…");
+        void picoPublishSleep("full" + downs)
+          .then(() => picoUi("40分未検知：スリープ命令を送信しました（Switch本体の実行は未確認）"))
+          .catch(e => picoUi("40分未検知：スリープ送信失敗：" + e.message));
+      }
+    }
+    picoRenderIdle();
+    return;
+  }
+  const seconds = Math.ceil((PICO_IDLE_SLEEP_MS - picoIdleElapsedMs) / 1000);
+  if (seconds !== picoIdleDisplayedSecond) {
+    picoIdleDisplayedSecond = seconds;
+    picoRenderIdle();
+  }
+}
+
 function picoSendOnDetection() {
   if(!picoAutoSleep.checked) return;
   if(!picoReady){picoUi("歪み検知：MQTT未接続のためスリープ命令を送れませんでした");return;}
@@ -525,6 +612,8 @@ function drawLoop(ts) {
     lastProcess = ts;
     processFrame();
   }
+  // After recognition so an actual distortion match takes precedence.
+  picoTickIdleTimer(ts);
 
   requestAnimationFrame(drawLoop);
 }
@@ -600,6 +689,7 @@ view.addEventListener("pointerup", e => {
 
 function startTemplateSelection() {
   monitoring = false;
+  picoResetIdleTimer();
   stopAlarm();
   hits = misses = 0;
   armed = true;
@@ -799,6 +889,8 @@ function processFrame() {
 
   if (hits >= CONSECUTIVE_HITS && armed) {
     armed = false;
+    // A new confirmed distortion restarts the 40-minute no-detection window.
+    picoResetIdleTimer();
     setState("時空の歪みが発生しそうです！", "danger");
     picoSendOnDetection();
     startAlarm();
@@ -813,6 +905,7 @@ function toggleMonitoring() {
 
   if (selecting) return;
   monitoring = !monitoring;
+  picoResetIdleTimer();
   if (!monitoring) stopAlarm();
   hits = 0;
   misses = 0;
@@ -884,6 +977,8 @@ stopAlarmBtn.addEventListener("click", () => {
   if (monitoring) setState("監視中", "ok");
   else setState("停止中", "warn");
 });
+
+picoRenderIdle();
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
