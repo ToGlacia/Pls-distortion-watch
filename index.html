@@ -94,7 +94,7 @@
 </style>
 </head>
 <body>
-<header>PLA 時空の歪み監視 v4＋ntfy＋Pico</header>
+<header>PLA 時空の歪み監視 v4.1＋ntfy＋Pico</header>
 <div class="wrap">
 
   <video id="video" playsinline muted></video>
@@ -107,6 +107,7 @@
     <div id="state" class="big warn">停止中</div>
     <div>一致率: <span id="score">0.000</span></div>
     <div>連続一致: <span id="hits">0</span> / 3</div>
+    <div>カメラ状態: <span id="cameraHealth" class="warn">未起動</span></div>
     <div>テンプレート: <span id="templateState">未登録</span></div>
     <img id="templatePreview" alt="登録テンプレート">
   </div>
@@ -403,6 +404,7 @@ function picoIdleLabel() {
   if (!monitoring) return "40分タイマー：監視開始待ち";
   if (picoIdleFired) return "40分未検知：スリープ命令の送信を1回試行済み（監視を再開するとリセット）";
   if (!picoReady) return "40分タイマー：MQTT接続待ち（停止中）";
+  if (!cameraHealthy || cameraRecovering) return "40分タイマー：カメラ停止中（一時停止）";
   if (document.visibilityState !== "visible") return "40分タイマー：画面が非表示のため停止中";
   const seconds = Math.ceil(Math.max(0, PICO_IDLE_SLEEP_MS - picoIdleElapsedMs) / 1000);
   return "未検知の残り時間：" + String(Math.floor(seconds / 60)).padStart(2,"0") + ":" + String(seconds % 60).padStart(2,"0");
@@ -419,7 +421,7 @@ function picoResetIdleTimer() {
 }
 function picoTickIdleTimer(ts) {
   const active = monitoring && !!stream && video.readyState >= 2 &&
-    !selecting && document.visibilityState === "visible" &&
+    !selecting && cameraHealthy && !cameraRecovering && document.visibilityState === "visible" &&
     picoAutoSleep.checked && picoIdleSleep.checked && picoReady && !picoIdleFired;
   if (!active) {
     picoIdleLastTs = null;
@@ -540,49 +542,159 @@ async function requestWakeLock() {
 document.addEventListener("visibilitychange", async () => {
   if (document.visibilityState === "visible" && stream) {
     await requestWakeLock();
+    checkCameraHealth();
+  } else if (document.visibilityState !== "visible") {
+    picoIdleLastTs = null;
   }
 });
 
-async function startCamera() {
-  try {
-    await ensureAudio();
+// iOS camera watchdog: a live video element can retain readyState while frames freeze.
+const cameraHealthEl = document.getElementById("cameraHealth");
+const CAMERA_STALL_MS = 8000;
+let cameraHealthy = false;
+let cameraRecovering = false;
+let cameraEpoch = 0;
+let cameraLastFrameAt = 0;
+let cameraLastTime = -1;
+let cameraStartedAt = 0;
+let cameraRetryTimer = null;
+let cameraWatchdogTimer = null;
+let cameraLoopActive = false;
 
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { ideal: "environment" },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 }
-      },
-      audio: false
-    });
-
-    video.srcObject = stream;
-    await video.play();
-
+function cameraHealthLabel(message, cls="warn") {
+  cameraHealthEl.textContent = message;
+  cameraHealthEl.className = cls;
+}
+function cameraMarkFrame() {
+  cameraLastFrameAt = performance.now();
+  if (!cameraHealthy) {
+    cameraHealthy = true;
+    cameraHealthLabel("映像更新中", "ok");
+    if (monitoring) setState("監視中", "ok");
+  }
+}
+function watchVideoFrames(epoch) {
+  if (!video.requestVideoFrameCallback) return;
+  const next = () => {
+    if (epoch !== cameraEpoch || !stream) return;
+    cameraMarkFrame();
+    video.requestVideoFrameCallback(next);
+  };
+  video.requestVideoFrameCallback(next);
+}
+function startDrawingIfNeeded() {
+  if (!cameraLoopActive) {
+    cameraLoopActive = true;
+    requestAnimationFrame(drawLoop);
+  }
+}
+async function openCamera(isRecovery=false) {
+  const newStream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: {ideal:"environment"}, width:{ideal:1280}, height:{ideal:720} },
+    audio:false
+  });
+  stream = newStream;
+  video.srcObject = stream;
+  await video.play();
+  // Keep the same canvas geometry after a recovery so ROI and template stay valid.
+  if (!isRecovery) {
     const aspect = video.videoHeight / video.videoWidth;
     view.width = PROCESS_WIDTH;
     view.height = Math.round(PROCESS_WIDTH * aspect);
     procCanvas.width = view.width;
     procCanvas.height = view.height;
-
-    templateBtn.disabled = false;
     restoreTemplate();
-    await requestWakeLock();
-
+  }
+  cameraHealthy = false;
+  cameraStartedAt = performance.now();
+  cameraLastFrameAt = cameraStartedAt;
+  cameraLastTime = video.currentTime;
+  const epoch = ++cameraEpoch;
+  watchVideoFrames(epoch);
+  cameraHealthLabel("映像確認中", "warn");
+  templateBtn.disabled = false;
+  await requestWakeLock();
+  startDrawingIfNeeded();
+}
+async function recoverCamera() {
+  if (cameraRecovering || !stream || document.visibilityState !== "visible") return;
+  cameraRecovering = true;
+  cameraHealthy = false;
+  picoIdleLastTs = null;
+  hits = misses = 0;
+  hitsEl.textContent = "0";
+  cameraHealthLabel("再接続中", "warn");
+  setState("カメラ再接続中（監視一時停止）", "warn");
+  ++cameraEpoch;
+  const old = stream;
+  stream = null;
+  try { old.getTracks().forEach(t => t.stop()); } catch(e) {}
+  video.pause();
+  video.srcObject = null;
+  try {
+    await openCamera(true);
+    cameraRecovering = false;
+    cameraHealthLabel("再接続完了・映像確認中", "warn");
+  } catch(e) {
+    cameraHealthLabel("再接続失敗・再試行待ち", "danger");
+    setState("カメラ再接続待ち（監視一時停止）", "danger");
+    cameraRecovering = false;
+    clearTimeout(cameraRetryTimer);
+    cameraRetryTimer = setTimeout(async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        cameraRecovering = true;
+        await openCamera(true);
+        cameraRecovering = false;
+      } catch(err) {
+        cameraRecovering = false;
+        cameraHealthLabel("再接続失敗・カメラ開始を押してください", "danger");
+        cameraBtn.disabled = false;
+        cameraBtn.textContent = "カメラ再起動";
+      }
+    }, 5000);
+  }
+}
+function checkCameraHealth() {
+  if (!stream || cameraRecovering || document.visibilityState !== "visible") return;
+  const track = stream.getVideoTracks()[0];
+  if (!track || track.readyState !== "live") { void recoverCamera(); return; }
+  if (!video.requestVideoFrameCallback && video.readyState >= 2 && !video.paused) {
+    // Older browsers: media time is a weaker fallback than decoded-frame callbacks.
+    if (video.currentTime > cameraLastTime + 0.02) {
+      cameraLastTime = video.currentTime;
+      cameraMarkFrame();
+    }
+  }
+  if (performance.now() - cameraLastFrameAt > CAMERA_STALL_MS) void recoverCamera();
+}
+async function startCamera() {
+  if (cameraRecovering) return;
+  cameraBtn.disabled = true;
+  try {
+    await ensureAudio();
+    if (stream) {
+      ++cameraEpoch;
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+      video.srcObject = null;
+    }
+    await openCamera(!!templateBinary);
     setState("カメラ起動中", "ok");
     cameraBtn.textContent = "カメラ起動済み";
-    cameraBtn.disabled = true;
-
-    requestAnimationFrame(drawLoop);
-  } catch (e) {
-    alert("カメラを開始できませんでした。\nSafariのカメラ許可を確認してください。\n\n" + e);
+    if (!cameraWatchdogTimer) cameraWatchdogTimer = setInterval(checkCameraHealth, 2500);
+  } catch(e) {
+    cameraBtn.disabled = false;
+    cameraBtn.textContent = "カメラ再試行";
+    cameraHealthLabel("起動失敗", "danger");
+    alert("カメラを開始できませんでした。\nカメラ許可を確認してください。\n\n" + e);
   }
 }
 
 function drawLoop(ts) {
-  if (!stream) return;
+  if (!stream) { cameraLoopActive = false; return; }
 
-  if (!selecting) procCtx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
+  if (cameraHealthy && !cameraRecovering && !selecting) procCtx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
 
   ctx.clearRect(0, 0, view.width, view.height);
   ctx.drawImage(procCanvas, 0, 0);
@@ -608,7 +720,7 @@ function drawLoop(ts) {
     ctx.strokeRect(r.x, r.y, r.w, r.h);
   }
 
-  if (monitoring && ts - lastProcess >= PROCESS_INTERVAL) {
+  if (monitoring && cameraHealthy && !cameraRecovering && ts - lastProcess >= PROCESS_INTERVAL) {
     lastProcess = ts;
     processFrame();
   }
@@ -913,7 +1025,7 @@ function toggleMonitoring() {
 
   if (monitoring) {
     monitorBtn.textContent = "監視停止";
-    setState("監視中", "ok");
+    setState(cameraHealthy ? "監視中" : "カメラ映像待ち（監視一時停止）", cameraHealthy ? "ok" : "warn");
     requestWakeLock();
   } else {
     monitorBtn.textContent = "③ 監視開始";
