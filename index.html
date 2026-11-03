@@ -94,7 +94,7 @@
 </style>
 </head>
 <body>
-<header>PLA 時空の歪み監視 v4.1＋ntfy＋Pico</header>
+<header>PLA 時空の歪み監視 v4.2＋ntfy＋Pico</header>
 <div class="wrap">
 
   <video id="video" playsinline muted></video>
@@ -108,6 +108,7 @@
     <div>一致率: <span id="score">0.000</span></div>
     <div>連続一致: <span id="hits">0</span> / 3</div>
     <div>カメラ状態: <span id="cameraHealth" class="warn">未起動</span></div>
+    <div>最終映像更新: <span id="cameraAge">--</span> / 復旧回数: <span id="cameraRestarts">0</span></div>
     <div>テンプレート: <span id="templateState">未登録</span></div>
     <img id="templatePreview" alt="登録テンプレート">
   </div>
@@ -404,7 +405,7 @@ function picoIdleLabel() {
   if (!monitoring) return "40分タイマー：監視開始待ち";
   if (picoIdleFired) return "40分未検知：スリープ命令の送信を1回試行済み（監視を再開するとリセット）";
   if (!picoReady) return "40分タイマー：MQTT接続待ち（停止中）";
-  if (!cameraHealthy || cameraRecovering) return "40分タイマー：カメラ停止中（一時停止）";
+  if (!cameraHealthy || cameraRecovering || cameraOpenPending) return "40分タイマー：カメラ停止中（一時停止）";
   if (document.visibilityState !== "visible") return "40分タイマー：画面が非表示のため停止中";
   const seconds = Math.ceil(Math.max(0, PICO_IDLE_SLEEP_MS - picoIdleElapsedMs) / 1000);
   return "未検知の残り時間：" + String(Math.floor(seconds / 60)).padStart(2,"0") + ":" + String(seconds % 60).padStart(2,"0");
@@ -421,7 +422,7 @@ function picoResetIdleTimer() {
 }
 function picoTickIdleTimer(ts) {
   const active = monitoring && !!stream && video.readyState >= 2 &&
-    !selecting && cameraHealthy && !cameraRecovering && document.visibilityState === "visible" &&
+    !selecting && cameraHealthy && !cameraRecovering && !cameraOpenPending && document.visibilityState === "visible" &&
     picoAutoSleep.checked && picoIdleSleep.checked && picoReady && !picoIdleFired;
   if (!active) {
     picoIdleLastTs = null;
@@ -548,18 +549,29 @@ document.addEventListener("visibilitychange", async () => {
   }
 });
 
-// iOS camera watchdog: a live video element can retain readyState while frames freeze.
+// v4.2: distinguish video frame delivery from the page animation loop.
+// Never use pixel differences: a perfectly still game screen is legitimate.
 const cameraHealthEl = document.getElementById("cameraHealth");
+const cameraAgeEl = document.getElementById("cameraAge");
+const cameraRestartsEl = document.getElementById("cameraRestarts");
 const CAMERA_STALL_MS = 8000;
+const CAMERA_OPEN_TIMEOUT_MS = 15000;
 let cameraHealthy = false;
 let cameraRecovering = false;
 let cameraEpoch = 0;
 let cameraLastFrameAt = 0;
 let cameraLastTime = -1;
-let cameraStartedAt = 0;
+let cameraLastPresentedFrames = -1;
 let cameraRetryTimer = null;
 let cameraWatchdogTimer = null;
 let cameraLoopActive = false;
+let cameraRestarts = 0;
+let cameraRetryCount = 0;
+let cameraFrameMethod = "";
+let cameraOpenPending = false;
+let cameraLastFrameMediaTime = -1;
+let cameraLastFrameNumber = -1;
+let cameraRafLastAt = 0;
 
 function cameraHealthLabel(message, cls="warn") {
   cameraHealthEl.textContent = message;
@@ -567,17 +579,26 @@ function cameraHealthLabel(message, cls="warn") {
 }
 function cameraMarkFrame() {
   cameraLastFrameAt = performance.now();
-  if (!cameraHealthy) {
+  if (!cameraHealthy && !cameraRecovering) {
     cameraHealthy = true;
-    cameraHealthLabel("映像更新中", "ok");
+    cameraRetryCount = 0;
+    cameraHealthLabel("映像更新中（" + cameraFrameMethod + "）", "ok");
     if (monitoring) setState("監視中", "ok");
   }
 }
 function watchVideoFrames(epoch) {
-  if (!video.requestVideoFrameCallback) return;
-  const next = () => {
+  if (typeof video.requestVideoFrameCallback !== "function") return;
+  const next = (_now, metadata) => {
     if (epoch !== cameraEpoch || !stream) return;
-    cameraMarkFrame();
+    // A callback only proves freshness if the frame number/media timestamp advanced.
+    const n = metadata.presentedFrames;
+    const t = metadata.mediaTime;
+    if ((Number.isFinite(n) && n > cameraLastFrameNumber) ||
+        (Number.isFinite(t) && t > cameraLastFrameMediaTime + 0.001)) {
+      if (Number.isFinite(n)) cameraLastFrameNumber = n;
+      if (Number.isFinite(t)) cameraLastFrameMediaTime = t;
+      cameraMarkFrame();
+    }
     video.requestVideoFrameCallback(next);
   };
   video.requestVideoFrameCallback(next);
@@ -588,146 +609,200 @@ function startDrawingIfNeeded() {
     requestAnimationFrame(drawLoop);
   }
 }
-async function openCamera(isRecovery=false) {
-  const newStream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: {ideal:"environment"}, width:{ideal:1280}, height:{ideal:720} },
-    audio:false
-  });
-  stream = newStream;
-  video.srcObject = stream;
-  await video.play();
-  // Keep the same canvas geometry after a recovery so ROI and template stay valid.
-  if (!isRecovery) {
-    const aspect = video.videoHeight / video.videoWidth;
-    view.width = PROCESS_WIDTH;
-    view.height = Math.round(PROCESS_WIDTH * aspect);
-    procCanvas.width = view.width;
-    procCanvas.height = view.height;
-    restoreTemplate();
-  }
+function stopCurrentCamera() {
+  ++cameraEpoch;
+  const old = stream;
+  stream = null;
   cameraHealthy = false;
-  cameraStartedAt = performance.now();
-  cameraLastFrameAt = cameraStartedAt;
-  cameraLastTime = video.currentTime;
+  picoIdleLastTs = null;
+  try { video.pause(); } catch(e) {}
+  video.srcObject = null;
+  if (old) try { old.getTracks().forEach(t => t.stop()); } catch(e) {}
+}
+function cameraTimeout(promise, ms, onLateResult) {
+  let timer, expired = false;
+  const guarded = Promise.resolve(promise).then(value => {
+    if (expired) { if (onLateResult) onLateResult(value); return; }
+    return value;
+  });
+  return Promise.race([
+    guarded,
+    new Promise((_,reject) => { timer = setTimeout(() => {
+      expired = true;
+      reject(new Error("カメラ起動タイムアウト"));
+    },ms); })
+  ]).finally(() => clearTimeout(timer));
+}
+async function openCamera(isRecovery=false) {
+  if (cameraOpenPending) throw Error("カメラ起動処理中です");
+  cameraOpenPending = true;
   const epoch = ++cameraEpoch;
-  watchVideoFrames(epoch);
-  cameraHealthLabel("映像確認中", "warn");
-  templateBtn.disabled = false;
-  await requestWakeLock();
-  startDrawingIfNeeded();
+  let acquired = null;
+  try {
+    acquired = await cameraTimeout(navigator.mediaDevices.getUserMedia({
+      video: { facingMode:{ideal:"environment"}, width:{ideal:1280}, height:{ideal:720} },
+      audio:false
+    }), CAMERA_OPEN_TIMEOUT_MS, late => {
+      if (late) late.getTracks().forEach(t => t.stop());
+    });
+    if (!acquired || epoch !== cameraEpoch) throw Error("カメラ起動が中断されました");
+    stream = acquired;
+    video.srcObject = acquired;
+    await cameraTimeout(video.play(), CAMERA_OPEN_TIMEOUT_MS);
+    if (epoch !== cameraEpoch) throw Error("カメラ起動が中断されました");
+    if (!isRecovery) {
+      const aspect = video.videoWidth ? video.videoHeight / video.videoWidth : 9/16;
+      view.width = PROCESS_WIDTH;
+      view.height = Math.round(PROCESS_WIDTH * aspect);
+      procCanvas.width = view.width;
+      procCanvas.height = view.height;
+      restoreTemplate();
+    }
+    cameraHealthy = false;
+    cameraLastFrameAt = performance.now();
+    cameraLastTime = video.currentTime;
+    cameraLastPresentedFrames = -1;
+    cameraLastFrameNumber = -1;
+    cameraLastFrameMediaTime = -1;
+    cameraFrameMethod = typeof video.requestVideoFrameCallback === "function" ? "フレーム監視" :
+      (typeof video.getVideoPlaybackQuality === "function" ? "デコード数監視" : "再生時間監視");
+    watchVideoFrames(epoch);
+    cameraHealthLabel("映像確認中", "warn");
+    templateBtn.disabled = false;
+    void requestWakeLock();
+    startDrawingIfNeeded();
+    if (!cameraWatchdogTimer) cameraWatchdogTimer = setInterval(checkCameraHealth, 2000);
+  } catch(e) {
+    if (epoch === cameraEpoch) stopCurrentCamera();
+    else if (acquired) acquired.getTracks().forEach(t => t.stop());
+    throw e;
+  } finally { cameraOpenPending = false; }
 }
 async function recoverCamera() {
-  if (cameraRecovering || !stream || document.visibilityState !== "visible") return;
+  if (cameraRecovering || cameraOpenPending || document.visibilityState !== "visible") return;
   cameraRecovering = true;
   cameraHealthy = false;
   picoIdleLastTs = null;
   hits = misses = 0;
   hitsEl.textContent = "0";
+  cameraRestarts++;
+  cameraRestartsEl.textContent = String(cameraRestarts);
   cameraHealthLabel("再接続中", "warn");
-  setState("カメラ再接続中（監視一時停止）", "warn");
-  ++cameraEpoch;
-  const old = stream;
-  stream = null;
-  try { old.getTracks().forEach(t => t.stop()); } catch(e) {}
-  video.pause();
-  video.srcObject = null;
+  if (monitoring) setState("カメラ再接続中（監視一時停止）", "warn");
+  stopCurrentCamera();
   try {
     await openCamera(true);
-    cameraRecovering = false;
+    cameraRetryCount = 0;
     cameraHealthLabel("再接続完了・映像確認中", "warn");
   } catch(e) {
-    cameraHealthLabel("再接続失敗・再試行待ち", "danger");
-    setState("カメラ再接続待ち（監視一時停止）", "danger");
+    cameraRetryCount++;
+    cameraHealthLabel("再接続失敗（" + e.message + "）", "danger");
+    if (monitoring) setState("カメラ再接続待ち（監視一時停止）", "danger");
+    cameraBtn.disabled = false;
+    cameraBtn.textContent = "カメラ再起動";
+    // Bounded automatic retries; never reload the whole page or reset MQTT.
+    if (cameraRetryCount <= 3) {
+      clearTimeout(cameraRetryTimer);
+      cameraRetryTimer = setTimeout(() => {
+        if (document.visibilityState === "visible" && !stream) void recoverCamera();
+      }, 5000);
+    }
+  } finally {
     cameraRecovering = false;
-    clearTimeout(cameraRetryTimer);
-    cameraRetryTimer = setTimeout(async () => {
-      if (document.visibilityState !== "visible") return;
-      try {
-        cameraRecovering = true;
-        await openCamera(true);
-        cameraRecovering = false;
-      } catch(err) {
-        cameraRecovering = false;
-        cameraHealthLabel("再接続失敗・カメラ開始を押してください", "danger");
-        cameraBtn.disabled = false;
-        cameraBtn.textContent = "カメラ再起動";
-      }
-    }, 5000);
+    picoRenderIdle();
   }
 }
 function checkCameraHealth() {
-  if (!stream || cameraRecovering || document.visibilityState !== "visible") return;
+  if (document.visibilityState !== "visible" || cameraRecovering || cameraOpenPending) return;
+  if (!stream) return;
   const track = stream.getVideoTracks()[0];
-  if (!track || track.readyState !== "live") { void recoverCamera(); return; }
-  if (!video.requestVideoFrameCallback && video.readyState >= 2 && !video.paused) {
-    // Older browsers: media time is a weaker fallback than decoded-frame callbacks.
-    if (video.currentTime > cameraLastTime + 0.02) {
+  if (!track || track.readyState !== "live" || video.paused || video.readyState < 2) {
+    void recoverCamera(); return;
+  }
+  if (typeof video.requestVideoFrameCallback !== "function") {
+    if (typeof video.getVideoPlaybackQuality === "function") {
+      const n = video.getVideoPlaybackQuality().totalVideoFrames;
+      if (Number.isFinite(n) && n > cameraLastPresentedFrames) {
+        cameraLastPresentedFrames = n;
+        cameraMarkFrame();
+      }
+    } else if (video.currentTime > cameraLastTime + 0.02) {
       cameraLastTime = video.currentTime;
       cameraMarkFrame();
     }
   }
-  if (performance.now() - cameraLastFrameAt > CAMERA_STALL_MS) void recoverCamera();
+  const age = performance.now() - cameraLastFrameAt;
+  cameraAgeEl.textContent = (age / 1000).toFixed(1) + "秒";
+  if (age > CAMERA_STALL_MS) {
+    cameraHealthy = false;
+    cameraHealthLabel("映像停止を検出（" + (age/1000).toFixed(1) + "秒）", "danger");
+    if (monitoring) setState("映像停止・監視一時停止", "danger");
+    picoIdleLastTs = null;
+    void recoverCamera();
+  }
 }
 async function startCamera() {
-  if (cameraRecovering) return;
+  if (cameraRecovering || cameraOpenPending) return;
   cameraBtn.disabled = true;
+  clearTimeout(cameraRetryTimer);
   try {
     await ensureAudio();
-    if (stream) {
-      ++cameraEpoch;
-      stream.getTracks().forEach(t => t.stop());
-      stream = null;
-      video.srcObject = null;
-    }
+    if (stream) stopCurrentCamera();
     await openCamera(!!templateBinary);
-    setState("カメラ起動中", "ok");
+    setState(monitoring ? "カメラ映像待ち（監視一時停止）" : "カメラ起動中", "warn");
     cameraBtn.textContent = "カメラ起動済み";
-    if (!cameraWatchdogTimer) cameraWatchdogTimer = setInterval(checkCameraHealth, 2500);
   } catch(e) {
     cameraBtn.disabled = false;
     cameraBtn.textContent = "カメラ再試行";
-    cameraHealthLabel("起動失敗", "danger");
+    cameraHealthLabel("起動失敗：" + e.message, "danger");
     alert("カメラを開始できませんでした。\nカメラ許可を確認してください。\n\n" + e);
   }
 }
 
 function drawLoop(ts) {
-  if (!stream) { cameraLoopActive = false; return; }
-
-  if (cameraHealthy && !cameraRecovering && !selecting) procCtx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
-
-  ctx.clearRect(0, 0, view.width, view.height);
-  ctx.drawImage(procCanvas, 0, 0);
-
-  // Keep the effective search area visible, including the default area.
-  if (roi && templateBinary && !selecting) {
-    const r = searchRegion || {x:roi.x-SEARCH_MARGIN, y:roi.y-SEARCH_MARGIN,
-      w:roi.w+SEARCH_MARGIN*2, h:roi.h+SEARCH_MARGIN*2};
-    const x = Math.max(0, r.x), y = Math.max(0, r.y);
-    const right = Math.min(view.width, r.x+r.w);
-    const bottom = Math.min(view.height, r.y+r.h);
-    ctx.save();
-    ctx.strokeStyle = "#00ff73";
-    ctx.lineWidth = 2;
-    ctx.strokeRect(x, y, right-x, bottom-y);
-    ctx.restore();
+  // Keep the render loop alive while reconnecting. v4.1 exited when stream=null,
+  // which could leave the screen frozen after recovery.
+  if (!stream && !cameraRecovering && !cameraOpenPending) {
+    cameraLoopActive = false;
+    return;
   }
-
-  if (selecting && drawing && startPt && currentPt) {
-    const r = rectFromPoints(startPt, currentPt);
-    ctx.strokeStyle = "#ff3b30";
-    ctx.lineWidth = 3;
-    ctx.strokeRect(r.x, r.y, r.w, r.h);
+  try {
+    if (stream && cameraHealthy && !cameraRecovering && !selecting &&
+        document.visibilityState === "visible" && ts - cameraRafLastAt >= 100) {
+      cameraRafLastAt = ts; // 10fps canvas preview, recognition remains 450ms.
+      procCtx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
+    }
+    ctx.clearRect(0, 0, view.width, view.height);
+    ctx.drawImage(procCanvas, 0, 0);
+    if (roi && templateBinary && !selecting) {
+      const r = searchRegion || {x:roi.x-SEARCH_MARGIN, y:roi.y-SEARCH_MARGIN,
+        w:roi.w+SEARCH_MARGIN*2, h:roi.h+SEARCH_MARGIN*2};
+      const x = Math.max(0, r.x), y = Math.max(0, r.y);
+      const right = Math.min(view.width, r.x+r.w);
+      const bottom = Math.min(view.height, r.y+r.h);
+      ctx.save(); ctx.strokeStyle = "#00ff73"; ctx.lineWidth = 2;
+      ctx.strokeRect(x, y, right-x, bottom-y); ctx.restore();
+    }
+    if (selecting && drawing && startPt && currentPt) {
+      const r = rectFromPoints(startPt, currentPt);
+      ctx.strokeStyle = "#ff3b30"; ctx.lineWidth = 3;
+      ctx.strokeRect(r.x, r.y, r.w, r.h);
+    }
+    if (monitoring && cameraHealthy && !cameraRecovering &&
+        document.visibilityState === "visible" && ts - lastProcess >= PROCESS_INTERVAL) {
+      lastProcess = ts;
+      processFrame();
+    }
+    picoTickIdleTimer(ts);
+  } catch(e) {
+    cameraHealthy = false;
+    picoIdleLastTs = null;
+    cameraHealthLabel("映像処理エラー：" + e.message, "danger");
+    if (monitoring) setState("映像処理停止・監視一時停止", "danger");
+    if (!cameraRecovering) void recoverCamera();
+  } finally {
+    requestAnimationFrame(drawLoop);
   }
-
-  if (monitoring && cameraHealthy && !cameraRecovering && ts - lastProcess >= PROCESS_INTERVAL) {
-    lastProcess = ts;
-    processFrame();
-  }
-  // After recognition so an actual distortion match takes precedence.
-  picoTickIdleTimer(ts);
-
-  requestAnimationFrame(drawLoop);
 }
 
 function rectFromPoints(a, b) {
@@ -1086,7 +1161,7 @@ testBtn.addEventListener("click", async () => {
 
 stopAlarmBtn.addEventListener("click", () => {
   stopAlarm();
-  if (monitoring) setState("監視中", "ok");
+  if (monitoring) setState(cameraHealthy ? "監視中" : "カメラ映像待ち（監視一時停止）", cameraHealthy ? "ok" : "warn");
   else setState("停止中", "warn");
 });
 
